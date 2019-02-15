@@ -1,7 +1,7 @@
-// Package rollrus combines github.com/stvp/roll with github.com/sirupsen/logrus
+// Package rollrus combines github.com/rollbar/rollbar-go with github.com/sirupsen/logrus
 // via logrus.Hook mechanism, so that whenever logrus' logger.Error/f(),
 // logger.Fatal/f() or logger.Panic/f() are used the messages are
-// intercepted and sent to rollbar.
+// intercepted and sent to Rollbar.
 //
 // Using SetupLogging should suffice for basic use cases that use the logrus
 // singleton logger.
@@ -19,12 +19,13 @@ package rollrus
 
 import (
 	"fmt"
-	"os"
+	"runtime"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
+	rollbar "github.com/rollbar/rollbar-go"
 	"github.com/sirupsen/logrus"
-	"github.com/stvp/roll"
 )
 
 var defaultTriggerLevels = []logrus.Level{
@@ -33,13 +34,13 @@ var defaultTriggerLevels = []logrus.Level{
 	logrus.PanicLevel,
 }
 
-// Hook is a wrapper for the rollbar Client and is usable as a logrus.Hook.
+// Hook is a wrapper for the Rollbar Client and is usable as a logrus.Hook.
 type Hook struct {
-	roll.Client
+	*rollbar.Client
 	triggers        []logrus.Level
 	ignoredErrors   []error
 	ignoreErrorFunc func(error) bool
-	ignoreFunc      func(error, map[string]string) bool
+	ignoreFunc      func(error, map[string]interface{}) bool
 
 	// only used for tests to verify whether or not a report happened.
 	reported bool
@@ -86,7 +87,7 @@ func WithIgnoredErrors(errors ...error) OptionFunc {
 }
 
 // WithIgnoreErrorFunc is an OptionFunc that receives the error that is about
-// to be logged and returns true/false if it wants to fire a rollbar alert for.
+// to be logged and returns true/false if it wants to fire a Rollbar alert for.
 func WithIgnoreErrorFunc(fn func(error) bool) OptionFunc {
 	return func(h *Hook) {
 		h.ignoreErrorFunc = fn
@@ -94,15 +95,15 @@ func WithIgnoreErrorFunc(fn func(error) bool) OptionFunc {
 }
 
 // WithIgnoreFunc is an OptionFunc that receives the error and custom fields that are about
-// to be logged and returns true/false if it wants to fire a rollbar alert for.
-func WithIgnoreFunc(fn func(err error, fields map[string]string) bool) OptionFunc {
+// to be logged and returns true/false if it wants to fire a Rollbar alert for.
+func WithIgnoreFunc(fn func(err error, fields map[string]interface{}) bool) OptionFunc {
 	return func(h *Hook) {
 		h.ignoreFunc = fn
 	}
 }
 
 // NewHook creates a hook that is intended for use with your own logrus.Logger
-// instance. Uses the defualt report levels defined in wellKnownErrorFields.
+// instance. Uses the default report levels defined in wellKnownErrorFields.
 func NewHook(token string, env string, opts ...OptionFunc) *Hook {
 	h := NewHookForLevels(token, env, defaultTriggerLevels)
 
@@ -116,15 +117,15 @@ func NewHook(token string, env string, opts ...OptionFunc) *Hook {
 // NewHookForLevels provided by the caller. Otherwise works like NewHook.
 func NewHookForLevels(token string, env string, levels []logrus.Level) *Hook {
 	return &Hook{
-		Client:          roll.New(token, env),
+		Client:          rollbar.NewSync(token, env, "", "", ""),
 		triggers:        levels,
 		ignoredErrors:   make([]error, 0),
 		ignoreErrorFunc: func(error) bool { return false },
-		ignoreFunc:      func(error, map[string]string) bool { return false },
+		ignoreFunc:      func(error, map[string]interface{}) bool { return false },
 	}
 }
 
-// SetupLogging for use on Heroku. If token is not an empty string a rollbar
+// SetupLogging for use on Heroku. If token is not an empty string a Rollbar
 // hook is added with the environment set to env. The log formatter is set to a
 // TextFormatter with timestamps disabled.
 func SetupLogging(token, env string) {
@@ -145,22 +146,20 @@ func setupLogging(token, env string, levels []logrus.Level) {
 	}
 }
 
-// ReportPanic attempts to report the panic to rollbar using the provided
+// ReportPanic attempts to report the panic to Rollbar using the provided
 // client and then re-panic. If it can't report the panic it will print an
 // error to stderr.
 func (r *Hook) ReportPanic() {
 	if p := recover(); p != nil {
-		if _, err := r.Client.Critical(fmt.Errorf("panic: %q", p), nil); err != nil {
-			fmt.Fprintf(os.Stderr, "reporting_panic=false err=%q\n", err)
-		}
+		r.Client.ErrorWithLevel(rollbar.CRIT, fmt.Errorf("panic: %q", p))
 		panic(p)
 	}
 }
 
-// ReportPanic attempts to report the panic to rollbar if the token is set
+// ReportPanic attempts to report the panic to Rollbar if the token is set
 func ReportPanic(token, env string) {
 	if token != "" {
-		h := &Hook{Client: roll.New(token, env)}
+		h := &Hook{Client: rollbar.New(token, env, "", "", "")}
 		h.ReportPanic()
 	}
 }
@@ -176,7 +175,7 @@ func (r *Hook) Levels() []logrus.Level {
 // Fire the hook. This is called by Logrus for entries that match the levels
 // returned by Levels().
 func (r *Hook) Fire(entry *logrus.Entry) error {
-	trace, cause := extractError(entry)
+	cause := extractError(entry)
 	for _, ie := range r.ignoredErrors {
 		if ie == cause {
 			return nil
@@ -192,50 +191,51 @@ func (r *Hook) Fire(entry *logrus.Entry) error {
 		m["time"] = entry.Time.Format(time.RFC3339)
 	}
 
+	if _, exists := m["msg"]; !exists && entry.Message != "" {
+		m["msg"] = entry.Message
+	}
+
 	if r.ignoreFunc(cause, m) {
 		return nil
 	}
 
-	return r.report(entry, cause, m, trace)
+	r.report(entry, cause, m)
+
+	return nil
 }
 
-func (r *Hook) report(entry *logrus.Entry, cause error, m map[string]string, trace []uintptr) (err error) {
-	hasTrace := len(trace) > 0
+func (r *Hook) report(entry *logrus.Entry, cause error, m map[string]interface{}) {
 	level := entry.Level
 
 	r.reported = true
 
 	switch {
-	case hasTrace && level == logrus.FatalLevel:
-		_, err = r.Client.CriticalStack(cause, trace, m)
-	case hasTrace && level == logrus.PanicLevel:
-		_, err = r.Client.CriticalStack(cause, trace, m)
-	case hasTrace && level == logrus.ErrorLevel:
-		_, err = r.Client.ErrorStack(cause, trace, m)
-	case hasTrace && level == logrus.WarnLevel:
-		_, err = r.Client.WarningStack(cause, trace, m)
 	case level == logrus.FatalLevel || level == logrus.PanicLevel:
-		_, err = r.Client.Critical(cause, m)
+		skip := framesToSkip(2)
+		r.Client.ErrorWithStackSkipWithExtras(rollbar.CRIT, cause, skip, m)
 	case level == logrus.ErrorLevel:
-		_, err = r.Client.Error(cause, m)
+		skip := framesToSkip(2)
+		r.Client.ErrorWithStackSkipWithExtras(rollbar.ERR, cause, skip, m)
 	case level == logrus.WarnLevel:
-		_, err = r.Client.Warning(cause, m)
+		skip := framesToSkip(2)
+		r.Client.ErrorWithStackSkipWithExtras(rollbar.WARN, cause, skip, m)
 	case level == logrus.InfoLevel:
-		_, err = r.Client.Info(entry.Message, m)
+		r.Client.MessageWithExtras(rollbar.INFO, entry.Message, m)
 	case level == logrus.DebugLevel:
-		_, err = r.Client.Debug(entry.Message, m)
+		r.Client.MessageWithExtras(rollbar.DEBUG, entry.Message, m)
 	}
-	return err
 }
 
-// convertFields converts from log.Fields to map[string]string so that we can
+// convertFields converts from log.Fields to map[string]interface{} so that we can
 // report extra fields to Rollbar
-func convertFields(fields logrus.Fields) map[string]string {
-	m := make(map[string]string)
+func convertFields(fields logrus.Fields) map[string]interface{} {
+	m := make(map[string]interface{})
 	for k, v := range fields {
 		switch t := v.(type) {
 		case time.Time:
 			m[k] = t.Format(time.RFC3339)
+		case error:
+			m[k] = t.Error()
 		default:
 			if s, ok := v.(fmt.Stringer); ok {
 				m[k] = s.String()
@@ -249,16 +249,9 @@ func convertFields(fields logrus.Fields) map[string]string {
 }
 
 // extractError attempts to extract an error from a well known field, err or error
-func extractError(entry *logrus.Entry) ([]uintptr, error) {
-	var trace []uintptr
-	fields := entry.Data
-
-	type stackTracer interface {
-		StackTrace() errors.StackTrace
-	}
-
+func extractError(entry *logrus.Entry) error {
 	for _, f := range wellKnownErrorFields {
-		e, ok := fields[f]
+		e, ok := entry.Data[f]
 		if !ok {
 			continue
 		}
@@ -267,21 +260,32 @@ func extractError(entry *logrus.Entry) ([]uintptr, error) {
 			continue
 		}
 
-		cause := errors.Cause(err)
-		tracer, ok := err.(stackTracer)
-		if ok {
-			return copyStackTrace(tracer.StackTrace()), cause
-		}
-		return trace, cause
+		return errors.Cause(err)
 	}
 
 	// when no error found, default to the logged message.
-	return trace, fmt.Errorf(entry.Message)
+	return fmt.Errorf(entry.Message)
 }
 
-func copyStackTrace(trace errors.StackTrace) (out []uintptr) {
-	for _, frame := range trace {
-		out = append(out, uintptr(frame))
+// framesToSkip returns the number of caller frames to skip
+// to get a stack trace that excludes rollrus and logrus.
+func framesToSkip(rollrusSkip int) int {
+	// skip 1 to get out of this function
+	skip := rollrusSkip + 1
+
+	// to get out of logrus, the amount can vary
+	// depending on how the user calls the log functions
+	// figure it out dynamically by skipping until
+	// we're out of the logrus package
+	for i := skip; ; i++ {
+		_, file, _, ok := runtime.Caller(i)
+		if !ok || !strings.Contains(file, "github.com/sirupsen/logrus") {
+			skip = i
+			break
+		}
 	}
-	return
+
+	// rollbar-go is skipping too few frames (2)
+	// subtract 1 since we're currently working from a function
+	return skip + 2 - 1
 }
