@@ -23,7 +23,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
 	rollbar "github.com/rollbar/rollbar-go"
 	"github.com/sirupsen/logrus"
 )
@@ -260,7 +259,7 @@ func extractError(entry *logrus.Entry) error {
 			continue
 		}
 
-		return errors.Cause(err)
+		return err
 	}
 
 	// when no error found, default to the logged message.
