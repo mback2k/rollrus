@@ -23,7 +23,7 @@ import (
 	"strings"
 	"time"
 
-	rollbar "github.com/rollbar/rollbar-go"
+	"github.com/rollbar/rollbar-go"
 	"github.com/sirupsen/logrus"
 )
 
@@ -174,7 +174,9 @@ func (r *Hook) Levels() []logrus.Level {
 // Fire the hook. This is called by Logrus for entries that match the levels
 // returned by Levels().
 func (r *Hook) Fire(entry *logrus.Entry) error {
-	cause := extractError(entry)
+	err := extractError(entry)
+	cause := errorCause(err)
+
 	for _, ie := range r.ignoredErrors {
 		if ie == cause {
 			return nil
@@ -198,7 +200,7 @@ func (r *Hook) Fire(entry *logrus.Entry) error {
 		return nil
 	}
 
-	r.report(entry, cause, m)
+	r.report(entry, err, m)
 
 	return nil
 }
@@ -287,4 +289,19 @@ func framesToSkip(rollrusSkip int) int {
 	// rollbar-go is skipping too few frames (2)
 	// subtract 1 since we're currently working from a function
 	return skip + 2 - 1
+}
+
+func errorCause(err error) error {
+	type causer interface {
+		Cause() error
+	}
+
+	for err != nil {
+		cause, ok := err.(causer)
+		if !ok {
+			break
+		}
+		err = cause.Cause()
+	}
+	return err
 }
