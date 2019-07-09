@@ -148,18 +148,14 @@ func setupLogging(token, env string, levels []logrus.Level) {
 // ReportPanic attempts to report the panic to Rollbar using the provided
 // client and then re-panic. If it can't report the panic it will print an
 // error to stderr.
-func (r *Hook) ReportPanic() {
-	if p := recover(); p != nil {
-		r.Client.ErrorWithLevel(rollbar.CRIT, fmt.Errorf("panic: %q", p))
-		panic(p)
-	}
-}
-
-// ReportPanic attempts to report the panic to Rollbar if the token is set
 func ReportPanic(token, env string) {
 	if token != "" {
-		h := &Hook{Client: rollbar.New(token, env, "", "", "")}
-		h.ReportPanic()
+		if p := recover(); p != nil {
+			defer panic(p)
+			r := rollbar.New(token, env, "", "", "")
+			r.ErrorWithLevel(rollbar.CRIT, fmt.Errorf("panic: %q", p))
+			r.Wait()
+		}
 	}
 }
 
@@ -214,6 +210,7 @@ func (r *Hook) report(entry *logrus.Entry, cause error, m map[string]interface{}
 	case level == logrus.FatalLevel || level == logrus.PanicLevel:
 		skip := framesToSkip(2)
 		r.Client.ErrorWithStackSkipWithExtras(rollbar.CRIT, cause, skip, m)
+		r.Client.Wait()
 	case level == logrus.ErrorLevel:
 		skip := framesToSkip(2)
 		r.Client.ErrorWithStackSkipWithExtras(rollbar.ERR, cause, skip, m)
